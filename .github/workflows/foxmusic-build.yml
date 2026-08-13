@@ -37,13 +37,14 @@ jobs:
             Accept = "application/vnd.github+json"
             "X-GitHub-Api-Version" = "2022-11-28"
           }
-          $uri = "https://api.github.com/repos/${{ github.repository }}/contents/payload/foxmods.enc?ref=main"
+          $uri = "https://api.github.com/repos/${{ github.repository }}/contents/payload/foxmods.b64?ref=main"
           $found = $false
           for ($i = 0; $i -lt 180; $i++) {
             try {
               $r = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get
-              $b64 = ($r.content -replace "`n", "")
-              [IO.File]::WriteAllBytes("foxmods.enc", [Convert]::FromBase64String($b64))
+              $apiB64 = ($r.content -replace "`n", "")
+              $payloadText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($apiB64)).Trim()
+              [IO.File]::WriteAllBytes("foxmods.enc", [Convert]::FromBase64String($payloadText))
               $found = $true
               break
             } catch {
@@ -99,10 +100,7 @@ jobs:
         working-directory: spotube
         shell: pwsh
         run: |
-          $candidates = @(
-            'build/windows/x64/runner/Release',
-            'build/windows/runner/Release'
-          )
+          $candidates = @('build/windows/x64/runner/Release','build/windows/runner/Release')
           $releaseDir = $candidates | Where-Object { Test-Path (Join-Path $_ 'foxmusic.exe') } | Select-Object -First 1
           if (-not $releaseDir) { throw 'foxmusic.exe not found after Flutter build.' }
           $full = (Resolve-Path $releaseDir).Path
@@ -119,10 +117,7 @@ jobs:
         working-directory: spotube
         shell: pwsh
         run: |
-          $iscc = @(
-            "$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe",
-            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
-          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          $iscc = @("$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe","$env:ProgramFiles\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $iscc) { throw 'ISCC.exe not found.' }
           & $iscc "/DRELEASE_DIR=${{ steps.bundle.outputs.release_dir }}" 'windows/packaging/foxmusic/foxmusic_installer.iss'
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
