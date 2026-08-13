@@ -3,7 +3,8 @@ name: FoxMusic Windows Build
 on:
   push:
     branches: [main]
-  workflow_dispatch:
+    paths:
+      - '.github/workflows/foxmusic-build.yml'
 
 permissions:
   contents: read
@@ -29,7 +30,7 @@ jobs:
           path: public.pem
           retention-days: 1
 
-      - name: Wait for encrypted FoxMusic patch
+      - name: Wait for chunked encrypted FoxMusic patch
         shell: pwsh
         run: |
           $headers = @{
@@ -37,21 +38,29 @@ jobs:
             Accept = "application/vnd.github+json"
             "X-GitHub-Api-Version" = "2022-11-28"
           }
-          $uri = "https://api.github.com/repos/${{ github.repository }}/contents/payload/foxmods.b64?ref=main"
-          $found = $false
-          for ($i = 0; $i -lt 180; $i++) {
+          $base = "https://api.github.com/repos/${{ github.repository }}/contents/payload"
+          $chunkCount = 0
+          for ($attempt = 0; $attempt -lt 180; $attempt++) {
             try {
-              $r = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get
-              $apiB64 = ($r.content -replace "`n", "")
-              $payloadText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($apiB64)).Trim()
-              [IO.File]::WriteAllBytes("foxmods.enc", [Convert]::FromBase64String($payloadText))
-              $found = $true
-              break
+              $ready = Invoke-RestMethod -Uri "$base/ready.txt?ref=main" -Headers $headers -Method Get
+              $readyApiB64 = ($ready.content -replace "`n", "")
+              $chunkCount = [int]([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($readyApiB64)).Trim())
+              if ($chunkCount -gt 0) { break }
             } catch {
               Start-Sleep -Seconds 10
             }
           }
-          if (-not $found) { throw "Encrypted payload was not received." }
+          if ($chunkCount -le 0) { throw "Encrypted payload marker was not received." }
+
+          $builder = New-Object Text.StringBuilder
+          for ($i = 0; $i -lt $chunkCount; $i++) {
+            $name = "chunk{0:D2}.txt" -f $i
+            $part = Invoke-RestMethod -Uri "$base/$name?ref=main" -Headers $headers -Method Get
+            $partApiB64 = ($part.content -replace "`n", "")
+            $partText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($partApiB64)).Trim()
+            [void]$builder.Append($partText)
+          }
+          [IO.File]::WriteAllBytes("foxmods.enc", [Convert]::FromBase64String($builder.ToString()))
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
