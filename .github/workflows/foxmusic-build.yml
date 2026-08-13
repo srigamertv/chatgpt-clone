@@ -17,68 +17,113 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
-      - name: Create ephemeral encryption key
-        shell: pwsh
-        run: |
-          openssl genrsa -out private.pem 3072
-          openssl rsa -in private.pem -pubout -out public.pem
-
-      - name: Publish public key
-        uses: actions/upload-artifact@v4
-        with:
-          name: foxmusic-public-key
-          path: public.pem
-          retention-days: 1
-
-      - name: Wait for chunked encrypted FoxMusic patch
-        shell: pwsh
-        run: |
-          $headers = @{
-            Authorization = "Bearer $env:GITHUB_TOKEN"
-            Accept = "application/vnd.github+json"
-            "X-GitHub-Api-Version" = "2022-11-28"
-          }
-          $base = "https://api.github.com/repos/${{ github.repository }}/contents/payload"
-          $chunkCount = 0
-          for ($attempt = 0; $attempt -lt 180; $attempt++) {
-            try {
-              $ready = Invoke-RestMethod -Uri "$base/ready.txt?ref=main" -Headers $headers -Method Get
-              $readyApiB64 = ($ready.content -replace "`n", "")
-              $chunkCount = [int]([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($readyApiB64)).Trim())
-              if ($chunkCount -gt 0) { break }
-            } catch {
-              Start-Sleep -Seconds 10
-            }
-          }
-          if ($chunkCount -le 0) { throw "Encrypted payload marker was not received." }
-
-          $builder = New-Object Text.StringBuilder
-          for ($i = 0; $i -lt $chunkCount; $i++) {
-            $name = "chunk{0:D2}.txt" -f $i
-            $part = Invoke-RestMethod -Uri "$base/$name?ref=main" -Headers $headers -Method Get
-            $partApiB64 = ($part.content -replace "`n", "")
-            $partText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($partApiB64)).Trim()
-            [void]$builder.Append($partText)
-          }
-          [IO.File]::WriteAllBytes("foxmods.enc", [Convert]::FromBase64String($builder.ToString()))
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Decrypt FoxMusic patch
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path payload_dec -Force | Out-Null
-          tar -xf foxmods.enc -C payload_dec
-          openssl pkeyutl -decrypt -inkey private.pem -in payload_dec/key.enc -out payload_dec/pass.bin -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
-          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in payload_dec/data.enc -out foxmods.tar.gz -pass file:payload_dec/pass.bin
-
       - name: Checkout Spotube v5.1.2 base
         shell: pwsh
         run: git clone --depth 1 --branch v5.1.2 https://github.com/KRTirtho/spotube.git spotube
 
-      - name: Apply FoxMusic source changes
+      - name: Apply FoxMusic core changes
+        working-directory: spotube
         shell: pwsh
-        run: tar -xzf foxmods.tar.gz -C spotube
+        run: |
+          @'
+          ENABLE_UPDATE_CHECK=0
+          LASTFM_API_KEY=
+          LASTFM_API_SECRET=
+          RELEASE_CHANNEL=stable
+          HIDE_DONATIONS=1
+          '@ | Set-Content -Encoding utf8 .env
+
+          @'
+          import 'package:spotube/models/database/database.dart';
+          import 'package:spotube/services/youtube_engine/newpipe_engine.dart';
+          import 'package:spotube/services/youtube_engine/youtube_engine.dart';
+          import 'package:spotube/services/youtube_engine/yt_dlp_engine.dart';
+          import 'package:youtube_explode_dart/youtube_explode_dart.dart';
+
+          class FoxMediaEngine implements YouTubeEngine {
+            final YoutubeClientEngine preferredEngine;
+            final NewPipeEngine _newPipe = NewPipeEngine();
+            final YtDlpEngine _ytDlp = YtDlpEngine();
+
+            FoxMediaEngine(this.preferredEngine);
+
+            YouTubeEngine get _primary =>
+                preferredEngine == YoutubeClientEngine.ytDlp ? _ytDlp : _newPipe;
+
+            Future<T> _run<T>(Future<T> Function(YouTubeEngine engine) action) async {
+              final primary = _primary;
+              try {
+                return await action(primary);
+              } catch (_) {
+                if (identical(primary, _ytDlp)) {
+                  return await action(_newPipe);
+                }
+                if (YtDlpEngine.isAvailableForPlatform && await YtDlpEngine.isInstalled()) {
+                  return await action(_ytDlp);
+                }
+                rethrow;
+              }
+            }
+
+            @override
+            Future<Video> getVideo(String videoId) => _run((engine) => engine.getVideo(videoId));
+            @override
+            Future<StreamManifest> getStreamManifest(String videoId) => _run((engine) => engine.getStreamManifest(videoId));
+            @override
+            Future<(Video, StreamManifest)> getVideoWithStreamInfo(String videoId) => _run((engine) => engine.getVideoWithStreamInfo(videoId));
+            @override
+            Future<List<Video>> searchVideos(String query) => _run((engine) => engine.searchVideos(query));
+            @override
+            void dispose() {
+              _newPipe.dispose();
+              _ytDlp.dispose();
+            }
+          }
+          '@ | Set-Content -Encoding utf8 lib/services/youtube_engine/fox_media_engine.dart
+
+          @'
+          import 'package:flutter_riverpod/flutter_riverpod.dart';
+          import 'package:spotube/provider/user_preferences/user_preferences_provider.dart';
+          import 'package:spotube/services/youtube_engine/fox_media_engine.dart';
+
+          final youtubeEngineProvider = Provider((ref) {
+            final engineMode = ref.watch(
+              userPreferencesProvider.select((value) => value.youtubeClientEngine),
+            );
+            return FoxMediaEngine(engineMode);
+          });
+          '@ | Set-Content -Encoding utf8 lib/provider/youtube_engine/youtube_engine.dart
+
+          $prefs = Get-Content lib/models/database/tables/preferences.dart -Raw
+          $prefs = $prefs.Replace('withDefault(Constant(YoutubeClientEngine.youtubeExplode.name))', 'withDefault(Constant(YoutubeClientEngine.newPipe.name))')
+          Set-Content lib/models/database/tables/preferences.dart $prefs -Encoding utf8
+
+          $main = Get-Content lib/main.dart -Raw
+          $main = $main.Replace('appName: "Spotube"', 'appName: "Fox Music"')
+          $main = $main.Replace("title: 'Spotube'", "title: 'Fox Music'")
+          Set-Content lib/main.dart $main -Encoding utf8
+
+          $cmake = Get-Content windows/CMakeLists.txt -Raw
+          $cmake = $cmake.Replace('project(spotube LANGUAGES CXX)', 'project(foxmusic LANGUAGES CXX)')
+          $cmake = $cmake.Replace('set(BINARY_NAME "spotube")', 'set(BINARY_NAME "foxmusic")')
+          Set-Content windows/CMakeLists.txt $cmake -Encoding utf8
+
+          $runner = Get-Content windows/runner/main.cpp -Raw
+          $runner = $runner.Replace('L"Spotube"', 'L"Fox Music"')
+          Set-Content windows/runner/main.cpp $runner -Encoding utf8
+
+          $rc = Get-Content windows/runner/Runner.rc -Raw
+          $rc = $rc.Replace('VALUE "CompanyName", "KRTirtho"', 'VALUE "CompanyName", "SR.IGAMER TV"')
+          $rc = $rc.Replace('VALUE "FileDescription", "spotube"', 'VALUE "FileDescription", "Fox Music"')
+          $rc = $rc.Replace('VALUE "InternalName", "spotube"', 'VALUE "InternalName", "foxmusic"')
+          $rc = $rc.Replace('VALUE "OriginalFilename", "spotube.exe"', 'VALUE "OriginalFilename", "foxmusic.exe"')
+          $rc = $rc.Replace('VALUE "ProductName", "spotube"', 'VALUE "ProductName", "Fox Music"')
+          Set-Content windows/runner/Runner.rc $rc -Encoding utf8
+
+          $pub = Get-Content pubspec.yaml -Raw
+          $pub = [regex]::Replace($pub, '(?m)^description:.*$', 'description: Fox Music - cross-platform music streaming app based on Spotube')
+          $pub = [regex]::Replace($pub, '(?m)^version:.*$', 'version: 0.1.0+1')
+          Set-Content pubspec.yaml $pub -Encoding utf8
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2.18.0
@@ -97,14 +142,13 @@ jobs:
           flutter config --enable-windows-desktop
           flutter pub get
           dart run build_runner build --delete-conflicting-outputs
-          dart run flutter_launcher_icons -f flutter_launcher_icons.yaml
 
-      - name: Build FoxMusic Windows release
+      - name: Build Windows Release
         working-directory: spotube
         shell: pwsh
         run: flutter build windows --release
 
-      - name: Package portable build
+      - name: Package Windows build
         id: bundle
         working-directory: spotube
         shell: pwsh
@@ -122,10 +166,43 @@ jobs:
         shell: pwsh
         run: choco install innosetup -y --no-progress
 
-      - name: Build installer
+      - name: Create and build installer
         working-directory: spotube
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Path windows/packaging/foxmusic -Force | Out-Null
+          @'
+          #define MyAppName "Fox Music"
+          #define MyAppVersion "0.1.0"
+          #define MyAppPublisher "SR.IGAMER TV"
+          #define MyAppExeName "foxmusic.exe"
+          #ifndef RELEASE_DIR
+            #define RELEASE_DIR "build\\windows\\x64\\runner\\Release"
+          #endif
+          [Setup]
+          AppId={{F9464971-C001-4F8B-A010-0F0100100001}
+          AppName={#MyAppName}
+          AppVersion={#MyAppVersion}
+          AppPublisher={#MyAppPublisher}
+          DefaultDirName={autopf}\\Fox Music
+          DefaultGroupName=Fox Music
+          OutputDir=..\\..\\..\\dist
+          OutputBaseFilename=FoxMusic_v0.1.0_Setup_x64
+          Compression=lzma2
+          SolidCompression=yes
+          ArchitecturesAllowed=x64compatible
+          ArchitecturesInstallIn64BitMode=x64compatible
+          [Files]
+          Source: "{#RELEASE_DIR}\\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+          [Icons]
+          Name: "{autoprograms}\\Fox Music"; Filename: "{app}\\{#MyAppExeName}"
+          Name: "{autodesktop}\\Fox Music"; Filename: "{app}\\{#MyAppExeName}"; Tasks: desktopicon
+          [Tasks]
+          Name: "desktopicon"; Description: "Criar atalho na area de trabalho"; GroupDescription: "Atalhos:"; Flags: unchecked
+          [Run]
+          Filename: "{app}\\{#MyAppExeName}"; Description: "Abrir Fox Music"; Flags: nowait postinstall skipifsilent
+          '@ | Set-Content windows/packaging/foxmusic/foxmusic_installer.iss -Encoding utf8
+
           $iscc = @("$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe","$env:ProgramFiles\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $iscc) { throw 'ISCC.exe not found.' }
           & $iscc "/DRELEASE_DIR=${{ steps.bundle.outputs.release_dir }}" 'windows/packaging/foxmusic/foxmusic_installer.iss'
@@ -135,14 +212,11 @@ jobs:
         working-directory: spotube
         shell: pwsh
         run: |
-          if (-not (Test-Path 'dist/foxmusic.exe')) { throw 'foxmusic.exe missing.' }
-          if (-not (Test-Path 'dist/FoxMusic_Windows_x64_v0.1.0.zip')) { throw 'Portable ZIP missing.' }
-          if (-not (Test-Path 'dist/FoxMusic_v0.1.0_Setup_x64.exe')) { throw 'Installer EXE missing.' }
+          Get-Item 'dist/foxmusic.exe','dist/FoxMusic_Windows_x64_v0.1.0.zip','dist/FoxMusic_v0.1.0_Setup_x64.exe'
           Get-FileHash 'dist/foxmusic.exe' -Algorithm SHA256
-          Get-FileHash 'dist/FoxMusic_Windows_x64_v0.1.0.zip' -Algorithm SHA256
           Get-FileHash 'dist/FoxMusic_v0.1.0_Setup_x64.exe' -Algorithm SHA256
 
-      - name: Upload FoxMusic Windows build
+      - name: Upload build
         uses: actions/upload-artifact@v4
         with:
           name: FoxMusic-v0.1.0-Windows-x64
