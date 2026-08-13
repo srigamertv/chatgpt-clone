@@ -1,0 +1,150 @@
+name: FoxMusic Windows Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: '3.35.2'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Create ephemeral encryption key
+        shell: pwsh
+        run: |
+          openssl genrsa -out private.pem 3072
+          openssl rsa -in private.pem -pubout -out public.pem
+
+      - name: Publish public key
+        uses: actions/upload-artifact@v4
+        with:
+          name: foxmusic-public-key
+          path: public.pem
+          retention-days: 1
+
+      - name: Wait for encrypted FoxMusic patch
+        shell: pwsh
+        run: |
+          $headers = @{
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $uri = "https://api.github.com/repos/${{ github.repository }}/contents/payload/foxmods.enc?ref=main"
+          $found = $false
+          for ($i = 0; $i -lt 180; $i++) {
+            try {
+              $r = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get
+              $b64 = ($r.content -replace "`n", "")
+              [IO.File]::WriteAllBytes("foxmods.enc", [Convert]::FromBase64String($b64))
+              $found = $true
+              break
+            } catch {
+              Start-Sleep -Seconds 10
+            }
+          }
+          if (-not $found) { throw "Encrypted payload was not received." }
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decrypt FoxMusic patch
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path payload_dec -Force | Out-Null
+          tar -xf foxmods.enc -C payload_dec
+          openssl pkeyutl -decrypt -inkey private.pem -in payload_dec/key.enc -out payload_dec/pass.bin -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in payload_dec/data.enc -out foxmods.tar.gz -pass file:payload_dec/pass.bin
+
+      - name: Checkout Spotube v5.1.2 base
+        shell: pwsh
+        run: git clone --depth 1 --branch v5.1.2 https://github.com/KRTirtho/spotube.git spotube
+
+      - name: Apply FoxMusic source changes
+        shell: pwsh
+        run: tar -xzf foxmods.tar.gz -C spotube
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2.18.0
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore and generate
+        working-directory: spotube
+        shell: pwsh
+        run: |
+          flutter config --enable-windows-desktop
+          flutter pub get
+          dart run build_runner build --delete-conflicting-outputs
+          dart run flutter_launcher_icons -f flutter_launcher_icons.yaml
+
+      - name: Build FoxMusic Windows release
+        working-directory: spotube
+        shell: pwsh
+        run: flutter build windows --release
+
+      - name: Package portable build
+        id: bundle
+        working-directory: spotube
+        shell: pwsh
+        run: |
+          $candidates = @(
+            'build/windows/x64/runner/Release',
+            'build/windows/runner/Release'
+          )
+          $releaseDir = $candidates | Where-Object { Test-Path (Join-Path $_ 'foxmusic.exe') } | Select-Object -First 1
+          if (-not $releaseDir) { throw 'foxmusic.exe not found after Flutter build.' }
+          $full = (Resolve-Path $releaseDir).Path
+          "release_dir=$full" >> $env:GITHUB_OUTPUT
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Compress-Archive -Path "$releaseDir/*" -DestinationPath 'dist/FoxMusic_Windows_x64_v0.1.0.zip' -Force
+          Copy-Item (Join-Path $releaseDir 'foxmusic.exe') 'dist/foxmusic.exe' -Force
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        working-directory: spotube
+        shell: pwsh
+        run: |
+          $iscc = @(
+            "$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { throw 'ISCC.exe not found.' }
+          & $iscc "/DRELEASE_DIR=${{ steps.bundle.outputs.release_dir }}" 'windows/packaging/foxmusic/foxmusic_installer.iss'
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
+
+      - name: Verify outputs
+        working-directory: spotube
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'dist/foxmusic.exe')) { throw 'foxmusic.exe missing.' }
+          if (-not (Test-Path 'dist/FoxMusic_Windows_x64_v0.1.0.zip')) { throw 'Portable ZIP missing.' }
+          if (-not (Test-Path 'dist/FoxMusic_v0.1.0_Setup_x64.exe')) { throw 'Installer EXE missing.' }
+          Get-FileHash 'dist/foxmusic.exe' -Algorithm SHA256
+          Get-FileHash 'dist/FoxMusic_Windows_x64_v0.1.0.zip' -Algorithm SHA256
+          Get-FileHash 'dist/FoxMusic_v0.1.0_Setup_x64.exe' -Algorithm SHA256
+
+      - name: Upload FoxMusic Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: FoxMusic-v0.1.0-Windows-x64
+          if-no-files-found: error
+          retention-days: 1
+          path: |
+            spotube/dist/foxmusic.exe
+            spotube/dist/FoxMusic_Windows_x64_v0.1.0.zip
+            spotube/dist/FoxMusic_v0.1.0_Setup_x64.exe
